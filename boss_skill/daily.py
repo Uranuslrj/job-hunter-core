@@ -34,7 +34,7 @@ from config_loader import path_of
 PY = sys.executable
 STATE = path_of("data/daily_state.json")
 
-STEPS = ["env", "follow", "resume", "accumulate", "send", "report", "eval"]
+STEPS = ["env", "follow", "accumulate", "send", "report", "eval"]  # resume 已暂停（2026-11-16 用户要求先停补发简历，恢复时加回）
 
 # 2026-11-07 加：每天目标攒够多少份可投招呼语。不够就换城市继续扫，扫到够为止。
 # 与 config/target_roles.yaml 的 delivery.daily_greet_cap=80 对齐。

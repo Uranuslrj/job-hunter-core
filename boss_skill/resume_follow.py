@@ -42,6 +42,12 @@ import resume_send
 
 CHAT_URL = "https://www.zhipin.com/web/geek/chat"
 
+# 发简历的范围（本人 2026-11-16 新增要求）：
+# 只发「我主动打过招呼（投过）」的岗位，HR 要简历才发；
+# 对方自己找上门、我没主动打招呼的要简历，不发。
+# 判断依据 = 台账 greeting_ledger.csv 里 sent='已发' 的 job_id 集合，
+# 见 find_resume_requests 里的 _greeted_job_ids()。
+
 # 系统提示里「已发出附件简历」的几种文案（用来判断这个会话我们到底发过没有）
 RESUME_SENT_MARKS = [
     "附件简历已发送", "对方已同意", "您的附件简历", "附件简历已发送给对方",
@@ -137,22 +143,57 @@ def _risk_words():
 # 判定：这条会话是不是「要简历但还没给」
 # ─────────────────────────────────────────────────────────────
 
+def _greeted_job_ids():
+    """读台账，返回「我已经主动打过招呼（sent=已发）」的 job_id 集合。
+
+    这是「我主动投过没」的权威依据：只有这些岗位，HR 要简历才发；
+    对方自己找上门、job_id 不在这个集合里的，不发。
+    """
+    import csv as _csv
+    ledger = path_of("data/greeting_ledger.csv")
+    ids = set()
+    try:
+        with open(ledger, encoding="utf-8") as f:
+            for row in _csv.DictReader(f):
+                if (row.get("sent") or "").strip() == "已发":
+                    jid = (row.get("job_id") or "").strip()
+                    if jid:
+                        ids.add(jid)
+    except FileNotFoundError:
+        pass
+    return ids
+
+
 def find_resume_requests(convs):
     """从会话列表筛出「要简历、还没发」的会话。
 
-    判「要简历」：对方最后一条（theirs）里带要简历词。
-    判「还没发」：会话最后一条不是系统「已发送附件」提示。
-    返回 [(conv, reason)] 清单，reason 是识别依据。
+    两路判定（2026-11-16 补）：
+      1. 文字路：对方最后一条（theirs）带要简历词 → 直接命中。
+      2. 空消息路：对方最后发言（theirs=True）但 lastMsg 为空 → 卡片式请求在
+         列表接口里不返回文字（闪念科技实测），必须点进对话页补查。
+
+    2026-11-16 新增（本人拍板）：只发「我主动打过招呼」的岗位。
+    —— HR 自己找上门、我没主动打招呼（job_id 不在台账「已发」集合里）的，
+    哪怕对方要简历也不发。判断依据 = 台账 sent='已发' 的 job_id 集合。
+    返回 [(conv, last_text)] 清单。
     """
+    greeted = _greeted_job_ids()
     out = []
     for c in convs:
         last = (c.get("last") or "")
-        # 对方最后一条在要简历，而且这条不是系统「已发送」提示
-        if c.get("theirs") and _wants_resume(last):
-            # 排除「已经发过了」：最后一条若已经是发送成功的系统提示，跳过
-            if any(m in last for m in RESUME_SENT_MARKS):
-                continue
+        theirs = c.get("theirs")
+        # 已经发过了：最后一条已是「已发送附件」系统提示，跳过
+        if any(m in last for m in RESUME_SENT_MARKS):
+            continue
+        # 核心新增：只发我主动打过招呼的岗位。job_id 空或不在台账「已发」里 → 跳过
+        jid = (c.get("job_id") or "").strip()
+        if not jid or jid not in greeted:
+            continue
+        if theirs and _wants_resume(last):
             out.append((c, last))
+        elif theirs and not last:
+            # 空消息 + 对方最后发言 → 可能是卡片请求，进对话页补查
+            out.append((c, ""))
     return out
 
 
@@ -177,22 +218,36 @@ def _open_conv(conv, job_title=""):
 # 判断是「卡片请求」还是「口头要」，并分别发
 # ─────────────────────────────────────────────────────────────
 
-# 卡片请求里的「同意」按钮：message-card-wrap 里的 card-btn，文字「同意」
+# 卡片请求里的「同意」按钮：message-card-wrap 里的 card-btn，文字「同意」。
+# 2026-11-16 实测（闪念科技）拿到真实 DOM：
+#   真卡片按钮：div.message-card-wrap.boss-green > div.message-card-buttons > span.card-btn（文字「同意」/「拒绝」）
+#   陷阱按钮：  div.message-tip-bar > div.respond-popover > div.op > span.btn.btn-agree（文字也「同意」）
+# 所以必须锁死在「message-card-wrap 容器内」的「span.card-btn」，且文字严格 ==「同意」，
+# 否则会点到 respond-popover 那组（class 是 btn-agree，不是 card-btn），可能点错历史请求。
 DETECT_CARD_JS = r"""
 (function(){
-  var cards = document.querySelectorAll('div.message-card-wrap');
+  // 只扫「当前会话聊天区」div.chat-conversation，避免 SPA 切换会话时
+  // 其他会话残留的卡片被全页面扫描误判（2026-11-16 实测踩坑：国科云招
+  // 会话里扫到了闪念科技的「要简历」卡片残留）。
+  var area = document.querySelector('div.chat-conversation');
+  if (!area) area = document;
+  var cards = area.querySelectorAll('div.message-card-wrap');
   var out = [];
   for (var i = 0; i < cards.length; i++) {
     var card = cards[i];
     var title = '';
-    var h3 = card.querySelector('h3.message-card-top-title, .message-card-top-title');
+    var h3 = card.querySelector('.message-card-top-title, .message-card-top-text, h3');
     if (h3) title = (h3.innerText || '').trim();
     var btns = [];
-    card.querySelectorAll('.card-btn, span.card-btn, .message-card-buttons span, .message-card-buttons button').forEach(function(b){
-      var t = (b.innerText || '').trim();
-      if (t) btns.push({text: t, cls: (b.className || '').toString()});
-    });
-    if (title || btns.length) out.push({title: title.slice(0,60), btns: btns});
+    var bs = card.querySelectorAll('div.message-card-buttons span.card-btn, div.message-card-buttons button.card-btn');
+    for (var j = 0; j < bs.length; j++) {
+      var t = (bs[j].innerText || '').trim();
+      if (t) btns.push(t);
+    }
+    // 只收「卡片里带『同意』按钮」的，且标题里含「简历」字样的附件简历请求卡片
+    if (btns.indexOf('同意') >= 0 && title.indexOf('简历') >= 0) {
+      out.push({title: title.slice(0,60), btns: btns});
+    }
   }
   return JSON.stringify(out);
 })()
@@ -200,12 +255,19 @@ DETECT_CARD_JS = r"""
 
 CLICK_AGREE_JS = r"""
 (function(){
-  var btns = document.querySelectorAll('.card-btn, span.card-btn, .message-card-buttons span, .message-card-buttons button');
-  for (var i = 0; i < btns.length; i++) {
-    var t = (btns[i].innerText || '').trim();
-    if (t === '同意') {
-      btns[i].click();
-      return 'CLICKED:' + (btns[i].className || '').toString().slice(0, 30);
+  // 只在「当前会话聊天区」内，找文字 ==「同意」的 span.card-btn
+  // （排除 respond-popover 的 btn-agree 陷阱，排除其他会话残留）
+  var area = document.querySelector('div.chat-conversation');
+  if (!area) area = document;
+  var cards = area.querySelectorAll('div.message-card-wrap');
+  for (var i = 0; i < cards.length; i++) {
+    var btns = cards[i].querySelectorAll('div.message-card-buttons span.card-btn, div.message-card-buttons button.card-btn');
+    for (var j = 0; j < btns.length; j++) {
+      var t = (btns[j].innerText || '').trim();
+      if (t === '同意') {
+        btns[j].click();
+        return 'CLICKED';
+      }
     }
   }
   return 'NOT_FOUND';
@@ -214,39 +276,201 @@ CLICK_AGREE_JS = r"""
 
 
 def _detect_card():
-    """探测当前会话里有没有「附件简历请求卡片」以及上面的按钮。返回 dict 或 None。"""
+    """探测当前会话里有没有「附件简历请求卡片」。返回 dict 或 None。
+
+    只认「message-card-wrap 里带『同意』按钮、且标题含『简历』」的卡片
+    （2026-11-16 实测的精确结构）。排除 respond-popover 的 btn-agree 陷阱按钮。
+    """
     raw = PD.eval_js(DETECT_CARD_JS, timeout=30)
     try:
         cards = json.loads(raw or "[]")
     except Exception:
         return None
     for c in cards:
-        # 卡片标题里带「简历」或按钮里有「同意」，都算附件简历请求卡片
-        if "简历" in (c.get("title") or "") or any(b.get("text") == "同意" for b in c.get("btns", [])):
+        title = c.get("title") or ""
+        btns = c.get("btns") or []
+        if "简历" in title and "同意" in btns:
             return c
     return None
 
 
-def _send_card():
-    """场景一：点「同意」，把附件简历发出去。返回 (ok, 说明)。"""
-    r = PD.eval_js(CLICK_AGREE_JS, timeout=30)
-    if r and r.startswith("CLICKED"):
-        return True, f"已点同意按钮（{r.split(':',1)[1] if ':' in r else ''}）"
-    return False, f"没找到「同意」按钮（探测返回 {r}）"
+# 点「同意」→ 弹「请选择要发送的简历」弹窗 → 选中目标简历 → 点「发送」的连贯 JS。
+# 2026-11-16 实测（闪念科技）彻底搞清楚真实机制：
+#   1. 点「同意」后弹的不是「上传简历」框，而是「请选择要发送的简历」框（列出已上传
+#      的 N 份简历，li.list-item + button.btn-confirm「发送」按钮，初始 disabled）。
+#   2. 必须先点选一份 li.list-item（点 li 本身，Vue @click 绑在 li 上），
+#      「发送」按钮才从 disabled 变亮。
+#   3. 再点「发送」，简历才真正发给 HR。
+#   4. 弹窗在 async JS 返回后会自动关，所以「点同意→选中→点发送」必须在一个
+#      async JS 里连贯完成，不能拆成多次 eval_js。
+#   5. 弹窗里可能有多个 dialog-wrap（deactive 是历史残留，active 是当前真弹窗），
+#      必须认 active。
+# 选中哪份：按「简历文件名」匹配（文件名已带公司名，如「李然举-闪念科技-AI产品经理.pdf」），
+#   精确选中刚定制的那份，不盲目选第一份。匹配不到才退而选第一份（并返回警告）。
+SEND_CARD_JS_TMPL = r"""
+(async function(){
+  var target = "__TARGET_NAME__";  // 要选中的简历文件名
+  var out = {agree:false, dialog:false, selected:false, sent:false, detail:""};
+
+  // 1. 点「同意」按钮（只在当前聊天区 message-card-wrap 内，排除 respond-popover 陷阱）
+  var area = document.querySelector('div.chat-conversation') || document;
+  var cards = area.querySelectorAll('div.message-card-wrap');
+  for (var i = 0; i < cards.length; i++) {
+    var btns = cards[i].querySelectorAll('div.message-card-buttons span.card-btn, div.message-card-buttons button.card-btn');
+    for (var j = 0; j < btns.length; j++) {
+      if ((btns[j].innerText || '').trim() === '同意') {
+        btns[j].click();
+        out.agree = true;
+        break;
+      }
+    }
+    if (out.agree) break;
+  }
+  if (!out.agree) { out.detail = 'NO_AGREE_BTN'; return JSON.stringify(out); }
+
+  // 2. 等「请选择要发送的简历」弹窗出现（最多 8 秒）
+  var dlg = null;
+  for (var k = 0; k < 16; k++) {
+    await new Promise(function(r){ setTimeout(r, 500); });
+    var d = document.querySelector('div.dialog-wrap.active');
+    if (d && d.querySelectorAll('li.list-item').length > 0) { dlg = d; break; }
+  }
+  if (!dlg) { out.detail = 'NO_SELECT_DIALOG'; return JSON.stringify(out); }
+  out.dialog = true;
+
+  // 3. 选中目标简历（按文件名匹配，精确选刚定制的那份）
+  var items = dlg.querySelectorAll('li.list-item');
+  var picked = null;
+  for (var m = 0; m < items.length; m++) {
+    var nameEl = items[m].querySelector('.resume-name');
+    var name = nameEl ? (nameEl.innerText || '').trim() : '';
+    if (name === target) { picked = items[m]; break; }
+  }
+  if (!picked) {
+    // 匹配不到，退而选第一份（但记警告）
+    picked = items[0];
+    out.detail = 'NAME_NOT_MATCH_FALLBACK_FIRST';
+  }
+  picked.click();
+  await new Promise(function(r){ setTimeout(r, 600); });
+  out.selected = true;
+
+  // 4. 确认「发送」按钮变亮（不再 disabled），点它
+  var send = dlg.querySelector('button.btn-confirm');
+  if (!send) { out.detail = 'NO_SEND_BTN'; return JSON.stringify(out); }
+  if (send.disabled) {
+    out.detail = 'SEND_STILL_DISABLED';
+    return JSON.stringify(out);
+  }
+  send.click();
+  await new Promise(function(r){ setTimeout(r, 1500); });
+  out.sent = true;
+  out.detail = 'SENT';
+  return JSON.stringify(out);
+})()
+"""
+
+
+def _send_card(pdf_path):
+    """场景一（卡片式）：点「同意」→ 弹「选择简历」框 → 选中目标简历 → 点「发送」。
+
+    2026-11-16 实测澄清（之前一直没搞对的地方）：
+    - 点「同意」≠ 直接发，也不走「上传简历」框。
+    - 真实链路是：点同意 → 弹「请选择要发送的简历」框（列出附件栏已有简历）→
+      选中一份 → 点「发送」→ 才真正发出。
+    - 弹窗在 JS 返回后自动关，所以整条链在一个 async JS 里连贯完成。
+    """
+    fname = os.path.basename(pdf_path)
+    js = SEND_CARD_JS_TMPL.replace("__TARGET_NAME__", fname)
+    raw = PD.eval_js(js, timeout=60)
+    try:
+        d = json.loads(raw or "{}")
+    except Exception:
+        return False, f"点同意发送返回无法解析：{raw}"
+    if d.get("sent"):
+        note = d.get("detail") or "SENT"
+        return True, f"已点同意并发送（选中：{fname}）"
+    if d.get("selected"):
+        return False, f"已选中简历但发送失败：{d.get('detail')}"
+    if d.get("dialog"):
+        return False, f"弹窗已出现但选中/发送失败：{d.get('detail')}"
+    return False, f"点同意后未进入发送流程：{d.get('detail') or raw}"
+
+
+# 点「发简历」→ 弹「请选择要发送的简历」框 → 选中目标简历 → 点「发送」。
+# 2026-11-16 本人确认：点「发简历」和点「同意」弹出的是同一个「请选择要发送的简历」
+# 弹窗（列出附件栏已有简历 + 发送按钮），不是「上传简历」框。所以场景二和场景一
+# 殊途同归，都是「选中已有简历 → 点发送」。
+SEND_BUTTON_JS_TMPL = r"""
+(async function(){
+  var target = "__TARGET_NAME__";
+  var out = {clicked:false, dialog:false, selected:false, sent:false, detail:""};
+
+  // 1. 点「发简历」按钮（底部工具栏 div.toolbar-btn，文字「发简历」）
+  var tb = document.querySelectorAll('div.toolbar-btn, [class*=toolbar] span, [class*=toolbar] div');
+  var clicked = false;
+  for (var i = 0; i < tb.length; i++) {
+    if ((tb[i].innerText || '').trim() === '发简历') {
+      tb[i].click();
+      clicked = true;
+      break;
+    }
+  }
+  if (!clicked) { out.detail = 'NO_SEND_RESUME_BTN'; return JSON.stringify(out); }
+  out.clicked = true;
+
+  // 2. 等弹窗
+  var dlg = null;
+  for (var k = 0; k < 16; k++) {
+    await new Promise(function(r){ setTimeout(r, 500); });
+    var d = document.querySelector('div.dialog-wrap.active');
+    if (d && d.querySelectorAll('li.list-item').length > 0) { dlg = d; break; }
+  }
+  if (!dlg) { out.detail = 'NO_SELECT_DIALOG'; return JSON.stringify(out); }
+  out.dialog = true;
+
+  // 3. 选中目标简历
+  var items = dlg.querySelectorAll('li.list-item');
+  var picked = null;
+  for (var m = 0; m < items.length; m++) {
+    var nameEl = items[m].querySelector('.resume-name');
+    var name = nameEl ? (nameEl.innerText || '').trim() : '';
+    if (name === target) { picked = items[m]; break; }
+  }
+  if (!picked) { picked = items[0]; out.detail = 'NAME_NOT_MATCH_FALLBACK_FIRST'; }
+  picked.click();
+  await new Promise(function(r){ setTimeout(r, 600); });
+  out.selected = true;
+
+  // 4. 点发送
+  var send = dlg.querySelector('button.btn-confirm');
+  if (!send) { out.detail = 'NO_SEND_BTN'; return JSON.stringify(out); }
+  if (send.disabled) { out.detail = 'SEND_STILL_DISABLED'; return JSON.stringify(out); }
+  send.click();
+  await new Promise(function(r){ setTimeout(r, 1500); });
+  out.sent = true;
+  out.detail = 'SENT';
+  return JSON.stringify(out);
+})()
+"""
 
 
 def _send_via_button(pdf_path):
-    """场景二：口头要简历 → 点「发简历」→ 上传 → 发出去。返回 (ok, 说明)。"""
-    # 点「发简历」按钮
-    r = PD.eval_js(resume_send.SEND_RESUME_CLICK_JS, timeout=30)
-    if r != "CLICKED":
-        return False, f"没点到「发简历」按钮（{r}）"
-    time.sleep(2)
-    # 弹窗出现后，调组件方法上传 PDF 并发送
-    ok, d = resume_send._upload_via_component(pdf_path, action="confirmAddAction")
-    if not ok:
-        return False, f"上传失败：{d}"
-    return True, f"已上传并触发发送：{d.get('fileName')}"
+    """场景二（口头要简历）：点「发简历」→ 弹「选择简历」框 → 选中 → 点「发送」。"""
+    fname = os.path.basename(pdf_path)
+    js = SEND_BUTTON_JS_TMPL.replace("__TARGET_NAME__", fname)
+    raw = PD.eval_js(js, timeout=60)
+    try:
+        d = json.loads(raw or "{}")
+    except Exception:
+        return False, f"点发简历发送返回无法解析：{raw}"
+    if d.get("sent"):
+        return True, f"已点发简历并发送（选中：{fname}）"
+    if d.get("selected"):
+        return False, f"已选中简历但发送失败：{d.get('detail')}"
+    if d.get("dialog"):
+        return False, f"弹窗已出现但选中/发送失败：{d.get('detail')}"
+    return False, f"点发简历后未进入发送流程：{d.get('detail') or raw}"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -300,43 +524,53 @@ def process_one(conv, last_text, dry=False):
     # 岗位名是定制简历的关键。查不到真实岗位名（jobs_today 里没有）时，
     # 用「AI产品实习生」兜底 —— 这是用户的主求职方向。但要记清楚是兜底。
     job_title = jt if jt else "AI产品实习生"
-    used_fallback = not jt
 
-    # 1. 定制简历
+    # 1. 定制简历（先定制，后面上传附件栏 + 点发送都用它）
     pdf = resume_send.build_resume(job_title, company, job_type="intern")
     if not pdf:
         return "skip", f"{company}｜定制简历失败（岗位名：{job_title}）"
 
-    # 2. 判附件空间 + 上传（满则删旧）
-    ok, d = _ensure_attachment_space(dry)
-    if not ok:
-        return "skip", f"{company}｜附件空间处理失败：{d}"
-    if not dry:
-        ok, d = resume_send._upload_via_component(pdf)
-        if not ok:
-            return "skip", f"{company}｜上传失败：{d}"
+    if dry:
+        # dry 不真上传不真发，但要知道会走哪条路，所以仍打开会话判断卡片/口头
+        if "/web/geek/chat" not in (PD.current_url() or ""):
+            PD.open_url(CHAT_URL)
+            time.sleep(4)
+        ok2, why = _open_conv(conv, job_title=jt)
+        if not ok2:
+            return "skip", f"{company}｜打开会话失败：{why}"
+        card = _detect_card()
+        if not last_text and not card:
+            return "skip", f"{company}｜空消息且无简历卡片，跳过"
+        mode = "卡片请求（点同意）" if card else "口头要（点发简历）"
+        return "dry", f"{company}｜{mode}｜pdf={os.path.basename(pdf)}"
 
-    # 3. 打开目标会话（先确保在聊天页；用真实岗位名匹配，防串号）
+    # 2. 上传到附件栏（复用 resume_send.upload_resume，内部：导航简历页→判满删最旧→
+    #    confirmAdd 保存进附件栏）。关键：点同意/发简历后弹的「请选择要发送的简历」框，
+    #    列的正是附件栏已有的简历。所以必须先上传，弹窗里才有刚定制的这份可选中。
+    ok = resume_send.upload_resume(pdf, confirm=False)
+    if not ok:
+        return "skip", f"{company}｜上传附件栏失败"
+    # 上传会导航到简历页，发之前必须回聊天页重新打开会话
     if "/web/geek/chat" not in (PD.current_url() or ""):
         PD.open_url(CHAT_URL)
         time.sleep(4)
     ok2, why = _open_conv(conv, job_title=jt)
     if not ok2:
-        return "skip", f"{company}｜打开会话失败：{why}"
+        return "skip", f"{company}｜上传后重新打开会话失败：{why}"
 
-    # 4. 判断卡片 or 口头
+    # 3. 判断卡片 or 口头
     card = _detect_card()
-    if dry:
-        mode = "卡片请求（点同意）" if card else "口头要（点发简历）"
-        return "dry", f"{company}｜{mode}｜pdf={os.path.basename(pdf)}"
+    if not last_text and not card:
+        return "skip", f"{company}｜空消息且无简历卡片，跳过"
 
-    # 风控再查一次（发之前）
+    # 4. 风控再查一次（发之前）
     risk = _risk_words()
     if risk:
         return "halt", f"出现风控「{risk}」，停"
 
+    # 5. 两种场景殊途同归：点入口按钮 → 弹「选择简历」框 → 选中刚上传的 → 点发送。
     if card:
-        ok3, why3 = _send_card()
+        ok3, why3 = _send_card(pdf)
     else:
         ok3, why3 = _send_via_button(pdf)
 

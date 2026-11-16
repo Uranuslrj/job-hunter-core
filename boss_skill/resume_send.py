@@ -207,16 +207,22 @@ def build_resume(job_title, company, job_type="intern", city=""):
     """按 JD 定制简历：改母版 → 生成 PDF → 跑验收。返回 PDF 路径或 None。
 
     job_title：岗位名（写进简历顶部「求职方向」和文件名）
-    company：公司名（仅用于日志/上传后对应，不再写进文件名）
+    company：公司名（写进文件名，用于发简历时在「选择简历」列表里区分是哪家公司）
     job_type：intern=实习岗 / formal=正式岗（决定到岗句写法）
     city：岗位所在城市（写进「目标地点」；不传则保留母版默认「北京」）
     """
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    # 文件名：{姓名}-{岗位}.pdf。姓名从环境变量 RESUME_NAME 读，开源版不硬编码真名。
+    # 文件名：{姓名}-{公司}-{岗位}.pdf（本人 2026-11-16 拍板：加回公司名，
+    # 因为发简历时 BOSS 弹「请选择要发送的简历」列表，不带公司名分不清是哪份）。
+    # 姓名从环境变量 RESUME_NAME 读，开源版不硬编码真名。
     owner = os.environ.get("RESUME_NAME", "我的简历")
     safe_job = job_title.replace("/", " ").replace("\\", " ").strip()
-    fname = f"{owner}-{safe_job}".strip()
+    safe_company = (company or "").replace("/", " ").replace("\\", " ").strip()
+    if safe_company:
+        fname = f"{owner}-{safe_company}-{safe_job}".strip()
+    else:
+        fname = f"{owner}-{safe_job}".strip()
     pdf_path = os.path.join(OUT_DIR, fname + ".pdf")
 
     # 读母版，做岗位相关的替换：求职方向 + 目标地点（含到岗句）
@@ -341,14 +347,20 @@ def _delete_attachment(resume_id):
 
 
 def _delete_first_attachment():
-    """删除附件栏最旧的一份（第一个 annex-item）。返回 True/False。"""
+    """删除附件栏最旧的一份。返回 True/False。
+
+    注意：BOSS 附件列表 attachmentList 是「最新在前、最旧在后」排序
+    （2026-11-16 实测：lst[0]=刚上传的最新一份，lst[-1]=最旧）。
+    所以「最旧」要删 lst[-1]，不是 lst[0]（之前删 lst[0] 会把刚上传的
+    简历删掉，陷入「上传→删自己刚传的」死循环）。
+    """
     lst = _list_attachments()
     if not lst:
         print("✗ 读不到附件列表，无法删除。")
         return False
-    first = lst[0]
-    print(f"准备删除最旧附件：{first.get('showName')}")
-    ok, d = _delete_attachment(first.get("resumeId"))
+    oldest = lst[-1]
+    print(f"准备删除最旧附件：{oldest.get('showName')}")
+    ok, d = _delete_attachment(oldest.get("resumeId"))
     if not ok:
         print(f"✗ 删除失败：{d}")
         return False
@@ -437,7 +449,36 @@ def upload_resume(pdf_path, confirm=True):
 # 会话列表 / 打开会话的三段 JS（从 send_cdp.py 原样搬过来，换插件驱动的 PD.eval_js 执行）。
 # 逻辑层不变，只把 F.evaluate 换成 PD.eval_js。
 JS_CONV_ITEMS = r"""
-(() => {
+(async () => {
+  // BOSS 会话列表是懒加载/虚拟滚动：初始只渲染视口内的一小段 li，
+  // 往下滚才加载更多。不滚就 read，靠后的会话根本不在 DOM 里，
+  // 导致「列表里找不到这家」误判（2026-11-16 实测：24 家后半段 12 家全漏）。
+  // 这里先反复滚到底，直到 li 数量不再增长，再读全量列表。
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const findScroller = () => {
+    // 优先 .user-list 本身；若它不可滚，找它的可滚动父容器
+    const ul = document.querySelector('div.user-list');
+    const cand = [];
+    if (ul) cand.push(ul);
+    let p = ul ? ul.parentElement : null;
+    while (p && p !== document.body) { cand.push(p); p = p.parentElement; }
+    for (const el of cand) {
+      if (el.scrollHeight > el.clientHeight + 10) return el;
+    }
+    return ul || document.scrollingElement || document.documentElement;
+  };
+  const scroller = findScroller();
+  let prev = -1;
+  for (let round = 0; round < 60; round++) {
+    scroller.scrollTop = scroller.scrollHeight;
+    await sleep(120);
+    const n = document.querySelectorAll('div.user-list li').length;
+    if (n === prev) {
+      // 连续两轮数量没变，说明滚到底了
+      if (round > 2) break;
+    }
+    prev = n;
+  }
   const arr = [];
   document.querySelectorAll('div.user-list li').forEach((e, i) => {
     arr.push([i, (e.innerText || '').replace(/[\r\n]+/g, ' ').slice(0, 140)]);
@@ -455,6 +496,46 @@ JS_CLICK_ITEM = r"""
   target.scrollIntoView({block: 'center'});
   target.click();
   return 'CLICKED';
+})()
+"""
+
+# 单步：滚一段 + 检查目标 + 命中即点。会话列表是虚拟滚动（2026-11-16 实测），
+# 静态读 li 只能拿到视口附近约 66 条。真正的滚动容器是 div.user-list-content。
+# 这个短 JS 每次只滚一段、查一次，单次 <2s，避免长循环触发 CDP relay 8s 超时。
+# 由 _open_chat_by_match 在 Python 侧循环调用，逐段往下扫直到命中或到底。
+# 返回：'CLICKED:<文本>' 命中并已点 / 'NOT_FOUND' 本段没命中 / 'BOTTOM' 到底了
+#       / 'NO_LIST' 没有列表。
+JS_SCROLL_STEP = r"""
+(async () => {
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const NEEDS = __NEEDS__;
+  const KEY = __KEY__;
+  const POS = __POS__;   // 要滚到的 scrollTop（由 Python 累加）
+  const ulc = document.querySelector('div.user-list-content');
+  if (!ulc) return 'NO_LIST';
+  const textOf = (li) => (li.innerText || '').replace(/\r?\n/g, ' ').trim();
+  const match = (t) => {
+    for (const need of [NEEDS, NEEDS.slice(0,2), NEEDS.slice(0,1)]) {
+      const keys = need.filter(x => x && x.length >= 2);
+      if (keys.length && keys.every(k => t.includes(k))) return true;
+    }
+    return (KEY && t.includes(KEY));
+  };
+  ulc.scrollTop = POS;
+  await sleep(250);
+  // 先看当前渲染的 li 有没有命中
+  for (const li of document.querySelectorAll('div.user-list li')) {
+    const t = textOf(li);
+    if (t && match(t)) {
+      const target = li.querySelector('.friend-content') || li;
+      target.scrollIntoView({block:'center'});
+      target.click();
+      return 'CLICKED:' + t.slice(0,80);
+    }
+  }
+  // 判定是否到底（scrollTop 不再能往下 + 出现「没有更多了」或 scrollHeight 稳定）
+  const atBottom = ulc.scrollTop + ulc.clientHeight >= ulc.scrollHeight - 5;
+  return atBottom ? 'BOTTOM' : 'NOT_FOUND';
 })()
 """
 
@@ -493,47 +574,48 @@ def _open_chat_by_match(boss="", company="", job_title=""):
     """在会话列表里按 HR 名+公司名+岗位名 打开目标会话（插件驱动）。
 
     返回 (True, 说明) / (False, 原因)。点完回读抬头核对，点错当场停。
-    与 send_cdp._open_conv 同套匹配逻辑，只是驱动换成 PD.eval_js。
+    2026-11-16 改：会话列表是虚拟滚动，静态读 li 只能拿到视口附近约 66 条，
+    靠后的会话（含今天刚聊过的）会漏。改成「滚动逐屏找 + 命中即点」，
+    用 JS_SCROLL_FIND_CLICK 一个连贯 JS 内完成，避免多次 eval 往返导致
+    页面状态漂移。
     """
     import json as _json
     boss = (boss or "").strip()
     comp = (company or "").strip()
     jt = (job_title or "").strip()
 
-    raw = PD.eval_js(JS_CONV_ITEMS, timeout=30)
-    try:
-        items = _json.loads(raw or "[]")
-    except Exception:
-        items = []
-    if not items:
-        return False, "读不到会话列表（可能不在聊天页）"
+    # 先把会话列表滚到顶（从最上往下找，覆盖最新会话）
+    PD.eval_js("(function(){var u=document.querySelector('div.user-list-content');if(u)u.scrollTop=0;return 'ok';})()", timeout=20)
 
-    idx = None
-    how = ""
-    # 四档匹配，从严到宽（同 send_cdp._open_conv）
-    for nick, need in (("HR名+公司名+岗位名", [boss, comp, jt]),
-                       ("HR名+公司名", [boss, comp]),
-                       ("HR名+职位名", [boss]),
-                       ("只认HR名", [boss])):
-        need = [x for x in need if x and len(x) >= 2]
-        if len(need) < 1:
-            continue
-        hits = [(i, t) for i, t in items if all(x in t for x in need)]
-        if len(hits) == 1:
-            idx, how = hits[0][0], f"{nick}唯一命中"
+    needs = [x for x in (boss, comp, jt) if x and len(x) >= 2]
+    key = comp[:6] if len(comp) >= 6 else ""
+
+    # Python 侧循环：逐段滚动，每段一个短 JS（<2s），直到命中或到底。
+    # 步长取视口高度的 2/3，保证相邻两段重叠、不漏。上限 40 段（覆盖长列表）。
+    pos = 0
+    hit_text = None
+    for _ in range(40):
+        js = (JS_SCROLL_STEP
+              .replace("__NEEDS__", _json.dumps(needs))
+              .replace("__KEY__", _json.dumps(key))
+              .replace("__POS__", str(pos)))
+        r = PD.eval_js(js, timeout=15)
+        if r is None:
+            # 单次失败重试一次（可能是页面瞬时状态）
+            r = PD.eval_js(js, timeout=15)
+        if r == "NO_LIST":
+            return False, "读不到会话列表（可能不在聊天页）"
+        if r and str(r).startswith("CLICKED:"):
+            hit_text = str(r)[len("CLICKED:"):]
             break
-        if hits and idx is None:
-            idx, how = hits[0][0], f"{nick}命中 {len(hits)} 个，取第一个（有风险）"
-    if idx is None and comp:
-        hits = [(i, t) for i, t in items if comp[:6] in t]
-        if hits:
-            idx, how = hits[0][0], "退回按公司名匹配（最不准，谨慎）"
-    if idx is None:
+        if r == "BOTTOM":
+            break
+        # 没命中、没到底：往下滚一段（步长 500，等下次循环读取最新 scrollHeight 后自适应）
+        pos += 500
+    if hit_text is None:
         return False, f"列表里找不到这家（{boss}｜{comp}）"
+    how = "滚动命中"
 
-    r = PD.eval_js(JS_CLICK_ITEM.replace("__IDX__", str(idx)), timeout=30)
-    if r != "CLICKED":
-        return False, f"点不动这个会话：{r}"
     time.sleep(3.0)
 
     raw2 = PD.eval_js(JS_CONV_READ, timeout=30)
@@ -551,7 +633,7 @@ def _open_chat_by_match(boss="", company="", job_title=""):
         return False, f"点开的不是这个岗位（抬头「{joined[:30]}」，找「{jt}」）"
     if not info.get("has_input"):
         return False, "点开了但没有输入框，不敢发"
-    return True, f"打开成功（{how}；抬头：{joined[:24]}）"
+    return True, f"打开成功（{how}；命中「{hit_text[:24]}」；抬头：{joined[:24]}）"
 
 
 # 聊天页「发简历」按钮：div.chat-controls 内 text="发简历" 的 toolbar-btn-content
