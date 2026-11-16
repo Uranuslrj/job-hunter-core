@@ -1,0 +1,15 @@
+# 模型接口配置（模板）
+# ─────────────────────────────────────────────────────────────
+# 填你自己的 API key，填完另存为 model.yaml。
+# ⚠ 本文件含密钥，绝不能提交到公开仓库。开源时只提交本 example 模板。
+
+backend: openai
+api_key: "{{你的API_KEY}}"                            # 例：ark-xxxx / sk-xxxx
+base_url: "{{你的接口地址}}"                           # 例：https://ark.cn-beijing.volces.com/api/v3
+model: "{{你的模型名}}"                                # 例：你的模型名
+
+# 多模型表（可选：想用多个模型时填）
+models:
+  # deepseek-v4-pro:
+  #   api_key: "{{另一个模型的KEY}}"
+  #   base_url: "https://api.deepseek.com"

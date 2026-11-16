@@ -1,0 +1,54 @@
+# ─────────────────────────────────────────────────────────────
+# .gitignore —— 开源前最后一道安全闸
+# 作用：让 Git 永远不把下面这些「含个人隐私 / 密钥 / 真实数据」的文件传到网上。
+# 你本地文件一个都不会被删，只是"传上 GitHub 时自动跳过"。
+# ─────────────────────────────────────────────────────────────
+
+# ===== 1. 真实配置（填了你个人信息的，绝不能公开）=====
+# 开源时只提交 config/*.example.yaml 模板，真实配置永远留在本地
+config/target_roles.yaml
+config/greeting_spec.yaml
+config/privacy.yaml
+config/model.yaml
+
+# ===== 2. 环境变量 / 密钥（含 API key）=====
+.env
+.env.*
+!.env.example
+resume-matcher/.env
+*.key
+*.pem
+*.token
+
+# ===== 3. 数据目录（台账 / 聊天记录 / 岗位数据 / 投递记录）=====
+data/
+*.csv
+*.bak
+*.bak-*
+
+# ===== 4. 简历文件（含你的姓名、学校、联系方式、照片）=====
+resume/
+resumes/
+*.pdf
+
+# ===== 5. 作品集 / 看板（可能含真实数据）=====
+dashboard/
+portfolio/
+
+# ===== 6. 工作区与本地缓存 =====
+.workbuddy/
+.wbapp_*
+*.log
+__pycache__/
+*.pyc
+
+# ===== 7. 研究草稿与内部文档（含求职策略、账号凭证分析）=====
+research/
+SOP/
+knowledge/
+docs/
+
+# ===== 8. 运行日志 / 脱敏工具 / 个人预览页（含真实数据或隐私）=====
+multi_agent/runs/
+scripts/desensitize_greeting.py
+manual_send.html

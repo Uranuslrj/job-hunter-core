@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>多 Agent 运行看板</title>
+<style>
+  :root{
+    --bg:#f5f5f4; --card:#ffffff; --line:#e5e5e5; --txt:#1c1c1c;
+    --muted:#888; --blue:#378ADD; --blue-bg:#E6F1FB;
+    --red:#E24B4A; --red-bg:#FCEBEB; --green:#1D9E75; --green-bg:#E1F5EE;
+    --amber:#BA7517; --amber-bg:#FAEEDA;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+       font-size:14px;line-height:1.6}
+  .wrap{max-width:860px;margin:0 auto;padding:24px 20px 60px}
+  h1{font-size:20px;font-weight:600;margin:0 0 4px}
+  .sub{color:var(--muted);font-size:13px;margin:0 0 20px}
+  .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:20px}
+  .toolbar select,.toolbar input,.toolbar button{
+    padding:8px 12px;border:1px solid var(--line);border-radius:8px;
+    background:var(--card);font-size:14px;font-family:inherit}
+  .toolbar button{cursor:pointer;background:var(--blue);color:#fff;border-color:var(--blue)}
+  .toolbar button.ghost{background:var(--card);color:var(--txt);border-color:var(--line)}
+  .toolbar .file{color:var(--muted);font-size:12px}
+  .stepper{display:flex;gap:8px;margin-bottom:20px}
+  .step{flex:1;padding:12px;border-radius:10px;border:1px solid var(--line);
+        background:var(--card);cursor:pointer;text-align:center;font-size:14px}
+  .step .dot{display:inline-block;width:9px;height:9px;border-radius:50%;
+             background:#ccc;margin-right:6px;vertical-align:middle}
+  .step.on{border-color:var(--blue);box-shadow:0 0 0 1px var(--blue)}
+  .step.done .dot{background:var(--green)}
+  .step.active .dot{background:var(--blue)}
+  .step .lbl{color:var(--muted);font-size:12px;display:block;margin-top:2px}
+  .metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
+           gap:12px;margin-bottom:20px}
+  .metric{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
+  .metric .k{color:var(--muted);font-size:12px;margin:0 0 4px}
+  .metric .v{font-size:22px;font-weight:600;margin:0}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;
+        padding:18px;margin-bottom:16px}
+  .card h2{font-size:15px;font-weight:600;margin:0 0 12px}
+  .timeline{position:relative;padding-left:24px}
+  .tl-item{position:relative;padding:0 0 18px;border-left:2px solid var(--line);
+           padding-left:18px}
+  .tl-item:last-child{border-left:2px solid transparent;padding-bottom:0}
+  .tl-item::before{content:"";position:absolute;left:-6px;top:3px;width:10px;height:10px;
+                   border-radius:50%;background:var(--blue)}
+  .tl-item.executor::before{background:var(--blue)}
+  .tl-item.critic::before{background:var(--amber)}
+  .tl-item.pass::before{background:var(--green)}
+  .tl-item.fix::before{background:var(--red)}
+  .tl-role{font-weight:600;font-size:14px}
+  .tl-time{color:var(--muted);font-size:12px;margin-left:8px}
+  .defect{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin:8px 0}
+  .tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:999px;margin-right:6px}
+  .tag-a{background:var(--red-bg);color:var(--red)}
+  .tag-b{background:var(--blue-bg);color:var(--blue)}
+  .tag-ok{background:var(--green-bg);color:var(--green)}
+  .basis{color:var(--muted);font-size:12px;margin-top:4px}
+  .output{background:#fafaf9;border:1px solid var(--line);border-radius:8px;
+          padding:12px;font-family:Consolas,monospace;font-size:13px;
+          white-space:pre-wrap;word-break:break-all}
+  .empty{color:var(--muted);text-align:center;padding:40px 0}
+  .hidden{display:none}
+  .pill{display:inline-block;font-size:12px;padding:2px 10px;border-radius:999px;margin-left:8px}
+  .pill.pass{background:var(--green-bg);color:var(--green)}
+  .pill.fail{background:var(--red-bg);color:var(--red)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>多 Agent 运行看板</h1>
+  <p class="sub">读取 multi_agent/runs/ 下的运行日志，展示执行者、批判者、裁决每一步在干什么。</p>
+
+  <div class="toolbar">
+    <select id="runSel"></select>
+    <button id="refreshBtn" class="ghost">刷新列表</button>
+    <button id="loadBtn">加载</button>
+    <span class="file" id="fileInfo"></span>
+  </div>
+
+  <div class="stepper" id="stepper">
+    <div class="step on" data-p="0"><span class="dot"></span>执行者<span class="lbl">产出方案</span></div>
+    <div class="step" data-p="1"><span class="dot"></span>批判者<span class="lbl">挑刺</span></div>
+    <div class="step" data-p="2"><span class="dot"></span>裁决<span class="lbl">最终结果</span></div>
+  </div>
+
+  <div class="metrics" id="metrics"></div>
+
+  <div class="card" id="panelExecutor">
+    <h2>执行者 · 产出方案</h2>
+    <div id="executorContent"><div class="empty">暂无数据</div></div>
+  </div>
+
+  <div class="card hidden" id="panelCritic">
+    <h2>批判者 · 缺陷列表</h2>
+    <div id="criticContent"><div class="empty">暂无数据</div></div>
+  </div>
+
+  <div class="card hidden" id="panelVerdict">
+    <h2>裁决 · 最终结果</h2>
+    <div id="verdictContent"><div class="empty">暂无数据</div></div>
+  </div>
+
+  <div class="card">
+    <h2>完整时间线</h2>
+    <div class="timeline" id="timeline"></div>
+  </div>
+</div>
+
+<script>
+let events = [];
+
+function listRuns(){
+  fetch('/api/runs').then(r=>r.json()).then(runs=>{
+    const sel = document.getElementById('runSel');
+    sel.innerHTML = '';
+    runs.forEach(r=>{
+      const o = document.createElement('option');
+      o.value = r;
+      o.textContent = r.replace('.jsonl','');
+      sel.appendChild(o);
+    });
+    if(runs.length){
+      sel.value = runs[runs.length-1];
+      loadRun(runs[runs.length-1]);
+    } else {
+      document.getElementById('fileInfo').textContent = '没有运行记录，先用 engine.py 跑一次';
+    }
+  });
+}
+
+function loadRun(name){
+  fetch('/api/run?file=' + encodeURIComponent(name)).then(r=>r.json()).then(data=>{
+    events = data;
+    document.getElementById('fileInfo').textContent = '当前：' + name;
+    render();
+  });
+}
+
+function render(){
+  const exOut = lastEvent('executor_output');
+  const criticOuts = events.filter(e=>e.event==='critic_output');
+  const passEv = events.find(e=>e.event==='critic_pass');
+  const end = events.find(e=>e.event==='run_end');
+  const allDefects = [];
+  criticOuts.forEach(c=>(c.defects||[]).forEach(d=>allDefects.push(d)));
+  const rounds = (end && end.summary && end.summary.critic_rounds) || criticOuts.length;
+  const passed = !!(passEv || (end && end.summary && end.summary.passed));
+
+  document.getElementById('metrics').innerHTML = `
+    <div class="metric"><p class="k">批判者轮数</p><p class="v">${rounds} / 2</p></div>
+    <div class="metric"><p class="k">挑出缺陷</p><p class="v">${allDefects.length}</p></div>
+    <div class="metric"><p class="k">最终判定</p><p class="v">${passed?'通过':'未通过'}</p></div>
+    <div class="metric"><p class="k">总耗时</p><p class="v">${end && end.summary ? (end.summary.elapsed_ms/1000).toFixed(1)+'s' : '-'}</p></div>`;
+
+  const stepEls = document.querySelectorAll('.step');
+  stepEls.forEach((s,i)=>{
+    s.classList.remove('done','active','on');
+    if(i===0) s.classList.add('done');
+    if(i===1 && criticOuts.length) s.classList.add('done');
+    if(i===2 && end) s.classList.add('done');
+  });
+
+  renderExecutor(exOut);
+  renderCritic(criticOuts, allDefects);
+  renderVerdict(end, passed);
+  renderTimeline();
+}
+
+function renderExecutor(exOut){
+  const el = document.getElementById('executorContent');
+  if(!exOut){ el.innerHTML = '<div class="empty">执行者还没产出</div>'; return; }
+  const o = exOut.output || {};
+  const yiju = (o['依据']||[]).map(x=>'<li>'+esc(x)+'</li>').join('');
+  const src = (o['引用来源']||[]).map(x=>'<li>'+esc(x)+'</li>').join('');
+  el.innerHTML = `
+    <p><b>方案：</b>${esc(o['方案']||'-')}</p>
+    <p><b>依据：</b></p><ul>${yiju || '<li>-</li>'}</ul>
+    <p><b>引用来源：</b></p><ul>${src || '<li>-</li>'}</ul>
+    <p><b>自信度：</b>${esc(o['自信度']||'-')}</p>`;
+}
+
+function renderCritic(criticOuts, allDefects){
+  const el = document.getElementById('criticContent');
+  if(!criticOuts.length){ el.innerHTML = '<div class="empty">批判者还没跑</div>'; return; }
+  let html = '';
+  criticOuts.forEach(c=>{
+    html += `<p style="color:var(--muted);font-size:12px">第 ${c.round} 轮</p>`;
+    const ds = c.defects || [];
+    if(!ds.length){
+      html += `<div class="defect"><span class="tag tag-ok">无缺陷</span>连续1轮无新缺陷，通过</div>`;
+    }
+    ds.forEach(d=>{
+      const cls = (d['类别']||'').indexOf('A')>=0 ? 'tag-a' : 'tag-b';
+      html += `<div class="defect">
+        <span class="tag ${cls}">${esc(d['类别']||'')}</span>${esc(d['内容']||'')}
+        <div class="basis">依据：${esc(d['依据']||'')}</div></div>`;
+    });
+  });
+  el.innerHTML = html;
+}
+
+function renderVerdict(end, passed){
+  const el = document.getElementById('verdictContent');
+  if(!end){ el.innerHTML = '<div class="empty">还没到裁决</div>'; return; }
+  const s = end.summary || {};
+  const f = s.final_output || {};
+  el.innerHTML = `
+    <p><b>最终判定：</b><span class="pill ${passed?'pass':'fail'}">${passed?'通过':'未通过'}</span></p>
+    <p><b>最终方案：</b></p>
+    <div class="output">${esc(JSON.stringify(f, null, 2))}</div>
+    <p style="margin-top:12px;color:var(--muted);font-size:12px">规则未自动改动（机器只提案，改规则由本人拍板）</p>`;
+}
+
+function renderTimeline(){
+  const el = document.getElementById('timeline');
+  if(!events.length){ el.innerHTML = '<div class="empty">暂无事件</div>'; return; }
+  let html = '';
+  events.forEach(e=>{
+    let cls = '';
+    let label = '';
+    let detail = '';
+    const t = new Date(e.ts*1000).toLocaleTimeString('zh-CN',{hour12:false});
+    if(e.event==='run_start'){ label='开始'; detail=esc(e.task||''); }
+    else if(e.event==='executor_output'){ cls='executor'; label=e.is_fix?'执行者 · 修正':'执行者 · 产出';
+      detail='方案：'+esc((e.output||{})['方案']||'-'); }
+    else if(e.event==='critic_output'){ cls='critic'; label='批判者 · 第'+e.round+'轮';
+      detail=(e.defects||[]).length+' 条缺陷，结论：'+esc(e.conclusion||'-'); }
+    else if(e.event==='critic_pass'){ cls='pass'; label='批判者通过'; detail=esc(e.reason||''); }
+    else if(e.event==='executor_fix'){ cls='fix'; label='打回执行者修正'; detail='改前 '+e.fix_count+' 个最严重缺陷'; }
+    else if(e.event==='run_end'){ cls='pass'; label='结束'; detail='总耗时 '+(e.summary.elapsed_ms/1000).toFixed(1)+'s'; }
+    else return;
+    html += `<div class="tl-item ${cls}">
+      <span class="tl-role">${label}</span><span class="tl-time">${t}</span>
+      <div>${detail}</div></div>`;
+  });
+  el.innerHTML = html;
+}
+
+function lastEvent(name){
+  for(let i=events.length-1;i>=0;i--){ if(events[i].event===name) return events[i]; }
+  return null;
+}
+
+function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,
+  c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+document.querySelectorAll('.step').forEach(s=>{
+  s.addEventListener('click',()=>{
+    const p = s.dataset.p;
+    document.getElementById('panelExecutor').classList.toggle('hidden', p!=='0');
+    document.getElementById('panelCritic').classList.toggle('hidden', p!=='1');
+    document.getElementById('panelVerdict').classList.toggle('hidden', p!=='2');
+    document.querySelectorAll('.step').forEach(x=>x.classList.remove('on'));
+    s.classList.add('on');
+  });
+});
+
+document.getElementById('loadBtn').addEventListener('click',()=>{
+  const v = document.getElementById('runSel').value;
+  if(v) loadRun(v);
+});
+document.getElementById('refreshBtn').addEventListener('click', listRuns);
+
+listRuns();
+</script>
+</body>
+</html>
